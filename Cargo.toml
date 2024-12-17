@@ -10,6 +10,7 @@
   petgraph    = "0.6.5"
   goblin      = "0.9.2"
   capstone    = "0.12.0"
+  keystone-engine = { version = "0.1.0", features = ["use-system-lib"] }
   glob        = "0.3.1"
   rangemap    = "1.5.1"
 

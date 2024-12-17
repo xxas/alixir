@@ -2,8 +2,7 @@ use std::collections::HashSet;
 use super::{ Instruction, Operation, Expression };
 
 #[derive(Debug)] pub struct BasicBlock
-{
-    /// Starting address of the block
+{   /// Starting address of the block
     start_addr: u64,
 
     /// Ending address of the block
@@ -20,8 +19,7 @@ use super::{ Instruction, Operation, Expression };
 }
 
 #[derive(Debug, Clone, Default)] pub struct BlockMetadata
-{
-    /// Variables defined in this block
+{   /// Variables defined in this block
     definitions: HashSet<String>,
 
     /// Variables used in this block
@@ -41,8 +39,7 @@ use super::{ Instruction, Operation, Expression };
 }
 
 #[derive(Debug, Clone)] pub enum BlockTerminator
-{
-    /// Return from function
+{   /// Return from function
     Return,
 
     /// Unconditional jump to address
