@@ -1,10 +1,11 @@
 use std::{ borrow::Borrow, cmp::Ordering,
     collections::HashSet, hash::{ Hash, Hasher },
-    ops::{BitXor, Range}, path::{ Path, PathBuf }, sync::LazyLock
+    ops::Range, path::{ Path, PathBuf }, sync::LazyLock
 };
 
-use derive_more::AsRef;
-use super::arch::{ Arch, X86_64 };
+use derive_more::{derive::Constructor, AsRef};
+use rangemap::RangeMap;
+use super::*;
 use thiserror::Error;
 use goblin::*;
 
@@ -12,13 +13,14 @@ pub type IncludePaths = HashSet<PathBuf>;
 
 #[derive(Error, Debug)] pub enum ModuleError
 {
-    #[error("failed to parse object file")]     Goblin(#[from] goblin::error::Error),
-    #[error("failed to open file from path")]   Io(#[from] std::io::Error),
-    #[error("object format is unsupported")]    Unsupported,
-    #[error("invalid file path")]               FilePath,
-    #[error("failed to locate an include")]     Missing,
-    #[error("nonconnonical path")]              Noncononical,
-    #[error("incompatible identities")]         Incompatible,
+    #[error("goblin failed with: {0}")]         Goblin(#[from] goblin::error::Error),
+    #[error("std::io failed with: {0}")]        Io(#[from] std::io::Error),
+    #[error("Unsupported feature: {0}")]        Feature(&'static str),
+    #[error("Invalid file path: {0}")]          FilePath(String),
+    #[error("Missed an included file: {0}")]    Missing(String),
+    #[error("nonconnonical path: {0}")]         Noncononical(String),
+    #[error("incompatible identities: {0}")]    Incompatible(&'static str),
+    #[error("malformed object file: {0}")]      Malformed(&'static str)
 }
 
 /// Recursively process `ld.so.conf` configurations.
@@ -91,7 +93,60 @@ static INCLUDE_PATHS: LazyLock<IncludePaths> = LazyLock::new(||
 
 bitflags::bitflags!
 {
-    #[derive(Debug, Default, Clone)] pub struct SymbolFlags: u8
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Perms: u8
+    {
+        const READ      = 0b001;
+        const WRITE     = 0b010;
+        const EXECUTE   = 0b100;
+
+        // Common permission combinations.
+        const RW        = Self::READ.bits() | Self::WRITE.bits();
+        const RX        = Self::READ.bits() | Self::EXECUTE.bits();
+        const RWX       = Self::READ.bits() | Self::WRITE.bits() | Self::EXECUTE.bits();
+    }
+}
+
+#[derive(Debug, Clone, Constructor)] pub struct Header
+{   // Raw data range within the file (p_offset..p_filesz).
+    pub file_range:  Range<usize>,
+
+    // Virtual memory range of the loaded header (p_vaddr..p_memsz)
+    pub vm_range: Range<usize>,
+
+    // Contains the corresponding section names for each address range.
+    pub shdr_ranges: RangeMap<usize, String>,
+
+    // Alignment of header (p_align).
+    pub align: u64,
+
+    // Header permissions.
+    pub perms: Perms
+}
+
+impl Header
+{   /// Returns a slice of `&'a [u8]` from an input `&'a [u8]`.
+    pub fn slice_from<'a>(&self, data: &'a [u8])
+        -> Option<&'a [u8]>
+    {
+        data.get(self.file_range.clone())
+    }
+
+    pub fn vm_len(&self)
+        -> usize
+    {
+        self.vm_range.end - self.vm_range.start
+    }
+
+    pub fn file_len(&self)
+        -> usize
+    {
+        self.file_range.end - self.file_range.start
+    }
+}
+
+bitflags::bitflags!
+{
+    #[derive(Debug, Default, PartialEq, Eq, Clone)] pub struct SymbolFlags: u8
     {   // Symbol Type (bits 1-0): 00=Variable/Data
         //                         01=Function
         //                         10=Indirect Function
@@ -137,10 +192,10 @@ bitflags::bitflags!
 /// The `Symbol` struct contains information about a found symbol within a `Module`.
 #[derive(Debug, Default)] pub struct Symbol
 {
-    name:    String,
-    flags:   SymbolFlags,
-    addr:    u64,
-    value:   Option<u64>,
+    pub name:    String,
+    pub flags:   SymbolFlags,
+    pub addr:    u64,
+    pub value:   Option<u64>,
 }
 
 impl Hash for Symbol
@@ -183,15 +238,13 @@ impl PartialOrd for Symbol
 }
 
 impl Symbol
-{
-    /// Creates a new symbol with basic information from an ELF symbol entry
-    pub fn new(name: &str, addr: u64, value: Option<u64>, base_flags: SymbolFlags, sym: &elf::Sym) 
-        -> Self 
-    {
-        // Start with base flags that indicate relocation type (PLT/REL/RELA)
+{   /// Creates a new `Symbol` struct with basic information from an ELF symbol entry.
+    pub fn new(name: &str, addr: u64, value: Option<u64>, base_flags: SymbolFlags, sym: &elf::Sym)
+        -> Self
+    {   // Start with base flags that indicate relocation type (PLT/REL/RELA).
         let mut flags = base_flags;
 
-        // Add symbol type information (bits 1-0)
+        // Add symbol type information (bits 1-0).
         flags |= match sym.st_type()
         {
             elf::sym::STT_FUNC      => SymbolFlags::TYPE_FUNC,
@@ -199,13 +252,13 @@ impl Symbol
             _                       => SymbolFlags::TYPE_VAR
         };
 
-        // Set resolution state (bit 2)
+        // Set resolution state (bit 2).
         if sym.st_shndx != (elf::section_header::SHN_UNDEF as usize)
         {
             flags |= SymbolFlags::RESOLVED;
         }
 
-        // Create the symbol, relocation-specific flags will be added later
+        // Create the symbol.
         Self
         {
             name: name.to_string(),
@@ -215,15 +268,17 @@ impl Symbol
         }
     }
 
-    /// Adds x86 relocation flags based on the relocation entry type
-    pub fn set_x86_reloc_flags(&mut self, reloc: &elf::Reloc) -> &mut Self
-    {   // Clear existing x86 relocation flags
+    /// Extends the `Symbol` information by relocation information.
+    pub fn set_x86_reloc_flags(&mut self, reloc: &elf::Reloc)
+        -> &mut Self
+    {   // Clear existing x86 relocation flags.
         self.flags &= !SymbolFlags::X86_MASK;
 
-        // Set new flags based on relocation type
+        // Set new flags based on relocation type.
         let x86_flags = match reloc.r_type
         {   // PC-relative relocations.
-            elf::reloc::R_X86_64_PC32 | elf::reloc::R_X86_64_PLT32 =>
+            elf::reloc::R_X86_64_PC32 |
+            elf::reloc::R_X86_64_PLT32 =>
             {
                 if self.flags.contains(SymbolFlags::RELOC_PLT)
                 {
@@ -236,41 +291,19 @@ impl Symbol
             },
 
             // Absolute relocations.
-            elf::reloc::R_X86_64_64                             => SymbolFlags::X86_ABS64,
-            elf::reloc::R_X86_64_32 | elf::reloc::R_X86_64_32S  => SymbolFlags::X86_ABS32,
+            elf::reloc::R_X86_64_64     => SymbolFlags::X86_ABS64,
+            elf::reloc::R_X86_64_32 |
+            elf::reloc::R_X86_64_32S    => SymbolFlags::X86_ABS32,
 
             // GOT-related relocations.
-            elf::reloc::R_X86_64_GOTPC32 | elf::reloc::R_X86_64_GOTPCREL    => SymbolFlags::X86_GOTPC32,
-            elf::reloc::R_X86_64_GOTOFF64                                   => SymbolFlags::X86_GOTOFF64,
-            _                                                               => SymbolFlags::X86_SPECIAL
+            elf::reloc::R_X86_64_GOTPC32 |
+            elf::reloc::R_X86_64_GOTPCREL   => SymbolFlags::X86_GOTPC32,
+            elf::reloc::R_X86_64_GOTOFF64   => SymbolFlags::X86_GOTOFF64,
+            _                               => SymbolFlags::X86_SPECIAL
         };
 
         self.flags |= x86_flags;
         self
-    }
-
-    pub fn name(&self)
-        -> &str
-    {
-        &self.name
-    }
-
-    pub fn addr(&self)
-        -> u64
-    {
-        self.addr
-    }
-
-    pub fn value(&self)
-        -> Option<u64>
-    {
-        self.value
-    }
-
-    pub fn flags(&self)
-        -> SymbolFlags
-    {
-        self.flags.clone()
     }
 }
 
@@ -332,7 +365,41 @@ impl Borrow<Path> for Module
 }
 
 impl Module
-{   // Retrieves all the include paths for dependencies.
+{
+    pub fn new(path: &impl AsRef<Path>, base_addr: u64)
+        -> Result<Module, ModuleError>
+    {
+        let bytes   = std::fs::read(path)?;
+        let path    = path.as_ref().to_path_buf();
+
+        Ok(Self
+        {
+            bytes,
+            base_addr,
+            path
+        })
+    }
+
+    /// Retrieves the architecture of the `Module`.
+    pub fn arch(&self)
+        -> Result<&Arch, ModuleError>
+    {
+        match self.object()?
+        {
+            Object::Elf(elf) =>
+            {   // TODO: Put more effort into resolving architectural information.
+                match elf.header.e_machine
+                {
+                    elf::header::EM_X86_64  => Ok(&arch::X86_64),
+                    _                       => Err(ModuleError::Feature("e_machine type")),
+                }
+            },
+            // Unsupported `Module` format type.
+            _ => Err(ModuleError::Feature("object type")),
+        }
+    }
+
+    /// Retrieves all the include paths for dependencies.
     pub fn include_paths(&self)
         -> Result<IncludePaths, ModuleError>
     {
@@ -362,7 +429,7 @@ impl Module
                 }
             },
             // Unsupported `Module` format type.
-            _ => return Err(ModuleError::Unsupported)
+            _ => return Err(ModuleError::Feature("object type"))
         }
         Ok(paths)
     }
@@ -397,7 +464,7 @@ impl Module
                         {
                             let Ok(canonical_path) = ld_path.canonicalize() else
                             {
-                                return Err(ModuleError::Noncononical)
+                                return Err(ModuleError::Noncononical(ld_path.to_string_lossy().to_string()))
                             };
 
                             let module = Module::new(&canonical_path, 0)?;
@@ -428,7 +495,7 @@ impl Module
                                 {
                                     let Ok(canonical_path) = mod_path.canonicalize() else
                                     {
-                                        return Err(ModuleError::Noncononical)
+                                        return Err(ModuleError::Noncononical(mod_path.to_string_lossy().to_string()))
                                     };
 
                                     let module = Module::new(&canonical_path, 0)?;
@@ -440,7 +507,7 @@ impl Module
                                 if i == search_paths.len()
                                 {   // We tried all the search paths and we're still missing a
                                     // shared object,we can't proceed without it.
-                                    return Err(ModuleError::Missing)
+                                    return Err(ModuleError::Missing(so_name.to_string()))
                                 }
                             }
                         }
@@ -448,7 +515,7 @@ impl Module
                     Ok(())
                 },
                 // Unsupported `Module` format type.
-                _ => Err(ModuleError::Unsupported)
+                _ => Err(ModuleError::Feature("object type"))
             }
         }
 
@@ -494,21 +561,24 @@ impl Module
     {
         let mut symbols = HashSet::new();
 
-        for rel in relocs.iter()
-        {   // Get corresponding symbol from dynamic symbol table
+        for (i, rel) in relocs.iter().enumerate()
+        {
             let Some(sym) = dynsyms.get(rel.r_sym) else
-            {
+            {   // Get the symbol for the relocation entry.
                 continue;
             };
 
             // Get symbol name, skip if empty
             let Some(sym_name) = dynstrtab.get_at(sym.st_name).filter(|s| !s.is_empty()) else
-            {
+            {   // Skip nameless entries.
                 continue;
             };
 
+            // Extract value related field; index or addend of reloc.
+            let value = rel.r_addend.map(|x| x as u64).unwrap_or(i as u64);
+
             // Create symbol with base information
-            let mut sym_info = Symbol::new(sym_name, rel.r_offset, rel.r_addend.map(|x| x as u64), base_flags.clone(), &sym);
+            let mut sym_info = Symbol::new(sym_name, rel.r_offset, Some(value), base_flags.clone(), &sym);
 
             // Add architecture-specific relocation information
             sym_info.set_x86_reloc_flags(&rel);
@@ -528,17 +598,11 @@ impl Module
         {
             Object::Elf(elf) =>
             {
-                let globals = Self::filter_symbols(
-                    |sym| sym.st_bind() == elf::sym::STB_GLOBAL ||
-                          sym.st_bind() == elf::sym::STB_WEAK,
-                    &elf.dynsyms,
-                    &elf.dynstrtab,
-                    self.base_addr(),
-                    SymbolFlags::empty());
-                Ok(globals)
+                Ok(Self::filter_symbols(|sym| sym.st_bind() == elf::sym::STB_GLOBAL || sym.st_bind() == elf::sym::STB_WEAK,
+                    &elf.dynsyms, &elf.dynstrtab, self.base_addr(), SymbolFlags::empty()))
             },
             // Unsupported `Module` format type.
-            _ => Err(ModuleError::Unsupported),
+            _ => Err(ModuleError::Feature("object type")),
         }
     }
 
@@ -550,16 +614,11 @@ impl Module
         {
             Object::Elf(elf) =>
             {
-                let locals = Self::filter_symbols(
-                    |sym| sym.st_bind() == elf::sym::STB_LOCAL,
-                    &elf.syms,
-                    &elf.strtab,
-                    self.base_addr(),
-                    SymbolFlags::empty());
-                Ok(locals)
+                Ok(Self::filter_symbols(|sym| sym.st_bind() == elf::sym::STB_LOCAL,
+                    &elf.syms, &elf.strtab, self.base_addr(), SymbolFlags::empty()))
             },
             // Unsupported `Module` format type.
-            _ => Err(ModuleError::Unsupported),
+            _ => Err(ModuleError::Feature("object type")),
         }
     }
 
@@ -572,27 +631,19 @@ impl Module
         match self.object()?
         {
             Object::Elf(elf) =>
-            {
-                rels.extend(Self::filter_relocs(
-                    &elf.pltrelocs,
-                    &elf.dynsyms,
-                    &elf.dynstrtab,
-                    SymbolFlags::RELOC_PLT));
+            {   // Pooled relocation sources.
+                let reloc_sources = [
+                    (&elf.pltrelocs,    SymbolFlags::RELOC_PLT),
+                    (&elf.dynrels,      SymbolFlags::RELOC_REL),
+                    (&elf.dynrelas,     SymbolFlags::RELOC_REL),
+                ];
 
-                rels.extend(Self::filter_relocs(
-                    &elf.dynrels,
-                    &elf.dynsyms,
-                    &elf.dynstrtab,
-                    SymbolFlags::RELOC_REL));
-
-                rels.extend(Self::filter_relocs(
-                    &elf.dynrelas,
-                    &elf.dynsyms,
-                    &elf.dynstrtab,
-                    SymbolFlags::RELOC_REL));
+                // Extend by each source.
+                rels.extend(reloc_sources.iter().flat_map(|(relocs, flags)|
+                        Self::filter_relocs(relocs, &elf.dynsyms, &elf.dynstrtab, flags.clone())));
             },
             // Unsupported `Module` format type.
-            _ => return Err(ModuleError::Unsupported)
+            _ => return Err(ModuleError::Feature("object type"))
         }
         Ok(rels)
     }
@@ -611,19 +662,19 @@ impl Module
                     {   // Check e_machine compatibility.
                         if elf.header.e_machine != other_elf.header.e_machine
                         {
-                            return Err(ModuleError::Incompatible)
+                            return Err(ModuleError::Incompatible("self.e_machine != other.e_machine"))
                         }
 
-                        // Elf identification range to compare for strict compatibility.
+                        // Strict elf identity range, these must match between object for compatibility.
                         const EI_RANGE: Range<usize> = elf::header::EI_CLASS..elf::header::EI_OSABI;
 
                         for (i, ident) in elf.header.e_ident[EI_RANGE].iter().enumerate()
-                        {
-                            let other = other_elf.header.e_ident[EI_RANGE.start + i];
+                        {   // Get the identity of the other ELF.
+                            let other_ident = &other_elf.header.e_ident[EI_RANGE.start + i];
 
-                            if other != *ident
-                            {
-                                return Err(ModuleError::Incompatible)
+                            if other_ident != ident
+                            {   // Strict comparision.
+                                return Err(ModuleError::Incompatible("self.ei_range != other.ei_range"))
                             }
                         }
 
@@ -632,23 +683,106 @@ impl Module
 
                         // Loosely compare ABI compatibility.
                         match (abi, other_abi)
-                        {   // Same types.
-                            (a, b) if a == b => {},
-                            // None/SYSV and Linux are considered compatible.
+                        {
+                            (a, b) if a == b => Ok(()),
                             (elf::header::ELFOSABI_NONE, elf::header::ELFOSABI_LINUX) |
-                            (elf::header::ELFOSABI_LINUX, elf::header::ELFOSABI_NONE) => {},
-                            // Unsupported combination of ABI versions.
-                            _ => return Err(ModuleError::Incompatible)
+                            (elf::header::ELFOSABI_LINUX, elf::header::ELFOSABI_NONE) =>
+                            {
+                                Ok(())
+                            },
+                            _   => Err(ModuleError::Incompatible("self.abi ~!= other.abi"))
                         }
-
-                        Ok(())
                     },
                     // Differing object file types.
-                    _ => Err(ModuleError::Incompatible)
+                    _ => Err(ModuleError::Incompatible("self.object != other.object"))
                 }
             },
             // Unsupported `Module` format type.
-            _ => Err(ModuleError::Unsupported)
+            _ => Err(ModuleError::Feature("object type"))
+        }
+    }
+
+    // Filter section headers by predicate.
+    pub fn filter_sections<F>(&self, pred: F)
+        -> Result<RangeMap<usize, String>, ModuleError>
+        where F: Fn(&(Range<usize>, &str)) -> bool
+    {
+        let mut sections = RangeMap::new();
+
+        match self.object()?
+        {
+            Object::Elf(elf) =>
+            {
+                for shdr in elf.section_headers.iter()
+                {   // Get the virtual memory range.
+                    let vm_range = shdr.vm_range();
+
+                    if vm_range.start == 0 || vm_range.end == 0 ||
+                       vm_range.start >= vm_range.end
+                    {   // Ignore section headers with impossible ranges.
+                        continue;
+                    }
+
+                    let Some(shdr_name) = elf.shdr_strtab.get_at(shdr.sh_name).filter(|s|!s.is_empty()) else
+                    {   // Ignore empty or stringless sections.
+                        continue;
+                    };
+
+                    // Construct the data we need to extract.
+                    let section = (vm_range, shdr_name);
+
+                    if !pred(&section)
+                    {   // Section header doesn't meet passed predicate.
+                        continue;
+                    }
+
+                    sections.insert(section.0, section.1.to_string());
+                }
+                Ok(sections)
+            }
+            _ => Err(ModuleError::Feature("object type"))
+        }
+    }
+
+    /// Filter program headers by predicate.
+    pub fn filter_headers<F>(&self, pred: F)
+        -> Result<Vec<Header>, ModuleError>
+        where F: Fn(&elf::ProgramHeader) -> bool
+    {
+        let mut headers = Vec::new();
+
+        match self.object()?
+        {
+            Object::Elf(elf) =>
+            {
+                for phdr in elf.program_headers.iter()
+                {
+                    if !pred(phdr)
+                    {   // Program header doesn't meet passed predicate.
+                        continue;
+                    }
+
+                    let perms = Perms::from_bits_truncate(
+                        ((phdr.p_flags & elf::program_header::PF_R != 0) as u8)      |
+                        ((phdr.p_flags & elf::program_header::PF_W != 0) as u8) << 1 |
+                        ((phdr.p_flags & elf::program_header::PF_X != 0) as u8) << 2
+                    );
+
+                    // Calculate the start/end address.
+                    let vm_range = phdr.vm_range();
+
+                    // Find all the section headers contained.
+                    let shdr_ranges = self.filter_sections(|shdr|
+                        shdr.0.start >= vm_range.start && shdr.0.end <= vm_range.end)?;
+
+                    // Extract our header information.
+                    let header = Header::new(phdr.file_range(), vm_range, shdr_ranges, phdr.p_align, perms);
+
+                    headers.push(header);
+                }
+                Ok(headers)
+            },
+            _ => Err(ModuleError::Feature("object type"))
         }
     }
 
@@ -682,10 +816,10 @@ impl Module
                 let aligned_size = (max_size + max_align - 1) & !(max_align - 1);
 
                 // Add 2MB minimum spacing between modules for safety,
-                // This matches memory mapping alignment found in glibc.
+                // this matches memory mapping alignments found in glibc.
                 Ok(aligned_size + 0x200000)
             },
-            _ => Err(ModuleError::Unsupported)
+            _ => Err(ModuleError::Feature("object type"))
         }
     }
 
@@ -695,25 +829,6 @@ impl Module
         -> Result<bool, ModuleError>
     {
         Ok(self.len()? == 0)
-    }
-
-    /// Retrieves the architecture of the `Module`.
-    pub fn arch(&self)
-        -> Result<&Arch, ModuleError>
-    {
-        match self.object()?
-        {
-            Object::Elf(elf) =>
-            {   // TODO: Put more effort into resolving architectural information.
-                match elf.header.e_machine
-                {
-                    elf::header::EM_X86_64  => Ok(&X86_64),
-                    _                       => Err(ModuleError::Unsupported),
-                }
-            },
-            // Unsupported `Module` format type.
-            _ => Err(ModuleError::Unsupported),
-        }
     }
 
     // Retrieves ref to the bytes of the `Module`.
@@ -742,19 +857,5 @@ impl Module
         -> Result<Object, ModuleError>
     {
         Ok(Object::parse(&self.bytes)?)
-    }
-
-    pub fn new(path: &impl AsRef<Path>, base_addr: u64)
-        -> Result<Module, ModuleError>
-    {
-        let bytes   = std::fs::read(path)?;
-        let path    = path.as_ref().to_path_buf();
-
-        Ok(Self
-        {
-            bytes,
-            base_addr,
-            path
-        })
     }
 }
