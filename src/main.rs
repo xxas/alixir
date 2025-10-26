@@ -1,10 +1,9 @@
-use std::collections::HashSet;
-
-use alixir::program::module::{Symbol, SymbolFlags};
+use std::io::{self, Write};
 
 fn main()
 {
     let path        = std::env::args().nth(1).expect("usage: alixir <binary>");
+
 
     // initialize our program from path into the loader.
     let mut loader = alixir::program::Loader::from_path(path, 0)
@@ -12,4 +11,6 @@ fn main()
 
     // Load our program, dependencies and do complete linkage.
     loader.load().expect("failed to load the program");
+
+    loader.memory.print_dump();
 }
